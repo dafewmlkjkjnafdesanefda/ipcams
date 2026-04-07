@@ -8,7 +8,7 @@ Usage:
     python3 ipcam_scanner.py [options]
 
 Options:
-    --subnet    192.168.1.0/24   Subnet to scan (auto-detected if omitted)
+    --subnet    192.168.1.0/24,10.0.0.0/24   Subnets to scan, comma-separated (default: all local interfaces)
     --timeout   1.0              Port scan connection timeout in seconds
     --output    /path/to/file    Output XML path (default: ~/Downloads/ip_cameras_<ts>.xml)
     --ports     80,554,8080      Comma-separated list of ports to scan
@@ -119,6 +119,45 @@ def derive_subnet(local_ip: str) -> str:
     """Assume /24 subnet from the local IP."""
     parts = local_ip.split(".")
     return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+
+
+def get_all_local_subnets() -> list:
+    """
+    Detect all active IPv4 subnets from every network interface using
+    Linux ioctl calls (SIOCGIFADDR / SIOCGIFNETMASK). Falls back to a
+    single /24 derived from the primary IP.
+    Returns a deduplicated list of subnet strings, e.g. ['192.168.1.0/24', '10.0.0.0/24'].
+    """
+    try:
+        import fcntl
+        SIOCGIFADDR    = 0x8915
+        SIOCGIFNETMASK = 0x891B
+
+        subnets = []
+        seen = set()
+        for iface_name, _ in socket.if_nameindex():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                iface_bytes = struct.pack("256s", iface_name.encode()[:15])
+                ip_raw = fcntl.ioctl(sock.fileno(), SIOCGIFADDR,    iface_bytes)[20:24]
+                nm_raw = fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, iface_bytes)[20:24]
+                sock.close()
+                ip      = socket.inet_ntoa(ip_raw)
+                netmask = socket.inet_ntoa(nm_raw)
+                if ip.startswith("127.") or ip == "0.0.0.0":
+                    continue
+                net = str(ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False))
+                if net not in seen:
+                    seen.add(net)
+                    subnets.append(net)
+            except Exception:
+                continue
+        if subnets:
+            return subnets
+    except Exception:
+        pass
+    # Fallback: single /24 from primary IP
+    return [derive_subnet(get_local_ip())]
 
 
 def get_mac_from_proc_arp(ip: str) -> str:
@@ -478,7 +517,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Discover IP cameras on the local network and export data to XML."
     )
-    parser.add_argument("--subnet",        default="",    help="Subnet to scan, e.g. 192.168.1.0/24")
+    parser.add_argument("--subnet",        default="",    help="Subnet(s) to scan, comma-separated (default: all local interfaces)")
     parser.add_argument("--timeout",       type=float, default=1.0,  help="Port scan timeout in seconds (default: 1.0)")
     parser.add_argument("--output",        default="",    help="Output XML file path (default: ~/Downloads/ip_cameras_<ts>.xml)")
     parser.add_argument("--ports",         default="",    help="Comma-separated ports to scan (default: built-in list)")
@@ -494,9 +533,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Resolve network parameters
+    # Resolve subnet list
+    if args.subnet:
+        subnets = [s.strip() for s in args.subnet.split(",") if s.strip()]
+    else:
+        subnets = get_all_local_subnets()
+
     local_ip = get_local_ip()
-    subnet   = args.subnet or derive_subnet(local_ip)
     ports    = [int(p.strip()) for p in args.ports.split(",")] if args.ports else CAMERA_PORTS
 
     # Resolve output path
@@ -508,7 +551,7 @@ def main():
     print("  IP Camera Scanner")
     print("=" * 60)
     print(f"  Local IP   : {local_ip}")
-    print(f"  Subnet     : {subnet}")
+    print(f"  Subnets    : {', '.join(subnets)}")
     print(f"  Ports      : {ports}")
     print(f"  Output     : {output_path}")
     print("=" * 60)
@@ -524,10 +567,8 @@ def main():
         for dev in onvif_devices:
             ip = dev["ip"]
             if ip not in cameras:
-                # Probe ports for this known IP
                 open_ports = scan_host_ports(ip, ports, args.timeout)
                 cam = enrich_camera(ip, open_ports, args.timeout, "ONVIF")
-                # Supplement with WS-Discovery scopes (may contain brand info)
                 for scope in dev.get("scopes", []):
                     for brand, _ in BRAND_SIGNATURES:
                         if brand.lower() in scope.lower() and not cam["manufacturer"]:
@@ -537,18 +578,19 @@ def main():
     else:
         print("\n[1/2] ONVIF WS-Discovery skipped (--no-onvif).")
 
-    # --- Phase 2: Port scanning ---
+    # --- Phase 2: Port scanning (all subnets) ---
     if not args.no_portscan:
-        print(f"\n[2/2] Port scanning subnet {subnet}...")
-        scan_results = scan_subnet(subnet, ports, args.timeout, args.workers)
-        new_found = 0
-        for ip, open_ports in scan_results.items():
-            if ip not in cameras:
-                cam = enrich_camera(ip, open_ports, args.timeout, "PortScan")
-                cameras[ip] = cam
-                new_found += 1
-                print(f"  + {ip}  [{cam['manufacturer'] or 'Unknown'}]  ports={open_ports}")
-        print(f"  Found {new_found} new device(s) via port scan.")
+        for idx, subnet in enumerate(subnets, start=1):
+            print(f"\n[2/2] Port scanning {subnet} ({idx}/{len(subnets)})...")
+            scan_results = scan_subnet(subnet, ports, args.timeout, args.workers)
+            new_found = 0
+            for ip, open_ports in scan_results.items():
+                if ip not in cameras:
+                    cam = enrich_camera(ip, open_ports, args.timeout, "PortScan")
+                    cameras[ip] = cam
+                    new_found += 1
+                    print(f"  + {ip}  [{cam['manufacturer'] or 'Unknown'}]  ports={open_ports}")
+            print(f"  Found {new_found} new device(s) on {subnet}.")
     else:
         print("\n[2/2] Port scanning skipped (--no-portscan).")
 
