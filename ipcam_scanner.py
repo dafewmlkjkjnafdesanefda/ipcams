@@ -130,6 +130,8 @@ def get_all_local_subnets() -> list:
     Detect all active IPv4 subnets from every network interface using
     Linux ioctl calls (SIOCGIFADDR / SIOCGIFNETMASK). Falls back to a
     single /24 derived from the primary IP.
+    /32 and /31 results (point-to-point or misconfigured interfaces) are
+    widened to /24 so the full local segment gets scanned.
     Returns a deduplicated list of subnet strings, e.g. ['192.168.1.0/24', '10.0.0.0/24'].
     """
     try:
@@ -150,10 +152,14 @@ def get_all_local_subnets() -> list:
                 netmask = socket.inet_ntoa(nm_raw)
                 if ip.startswith("127.") or ip == "0.0.0.0":
                     continue
-                net = str(ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False))
-                if net not in seen:
-                    seen.add(net)
-                    subnets.append(net)
+                net = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+                # /32 and /31 = point-to-point / host route → widen to /24
+                if net.prefixlen >= 31:
+                    net = ipaddress.IPv4Network(derive_subnet(ip), strict=False)
+                net_str = str(net)
+                if net_str not in seen:
+                    seen.add(net_str)
+                    subnets.append(net_str)
             except Exception:
                 continue
         if subnets:
