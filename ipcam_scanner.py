@@ -355,6 +355,38 @@ def build_rtsp_urls(ip: str, port: int, manufacturer: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Serial number retrieval
+# ---------------------------------------------------------------------------
+
+def get_dahua_serial(ip: str, timeout: float = 2.0) -> str:
+    """
+    Try to fetch the Dahua device serial number via the CGI API.
+    Returns the serial string (e.g. '3E04627PAK00077') or '' on failure.
+    """
+    import urllib.request
+
+    for path in [
+        "/cgi-bin/magicBox.cgi?action=getSerialNo",
+        "/cgi-bin/magicBox.cgi?action=getDeviceType",
+    ]:
+        try:
+            url = f"http://{ip}{path}"
+            req = urllib.request.Request(url, headers={"User-Agent": "ipcam-scanner/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(256).decode("utf-8", errors="replace").strip()
+            # Response format: "serialNo=3E04627PAK00077"
+            for line in body.splitlines():
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    val = val.strip()
+                    if val and val.upper() != "UNKNOWN":
+                        return val
+        except Exception:
+            continue
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Camera data assembly
 # ---------------------------------------------------------------------------
 
@@ -384,6 +416,9 @@ def enrich_camera(ip: str, open_ports: list, timeout: float, discovery_method: s
             cam["firmware"] = probe["firmware"]
         break  # one probe is enough
 
+    # Try to get serial number via Dahua CGI (works for Dahua and some OEM cameras)
+    cam["serial"] = get_dahua_serial(ip, timeout=timeout)
+
     # Build RTSP stream URLs
     if 554 in open_ports or 8554 in open_ports:
         cam["streams"] = build_rtsp_urls(ip, 554, cam["manufacturer"])
@@ -395,63 +430,38 @@ def enrich_camera(ip: str, open_ports: list, timeout: float, discovery_method: s
 # XML generation
 # ---------------------------------------------------------------------------
 
-def build_xml(cameras: list, local_ip: str, subnet: str, scan_duration: float) -> str:
-    """Build and return a pretty-printed XML string."""
-    root = ET.Element("IPCameraReport")
-    root.set("generated", datetime.now().isoformat(timespec="seconds"))
-    root.set("scanner", "ipcam_scanner")
-    root.set("total_found", str(len(cameras)))
+def build_xml(cameras: list, username: str, password: str) -> str:
+    """
+    Build a Dahua DeviceManager XML string (version 2.0).
+    Compatible with Dahua ConfigTool / SmartPSS device import.
+    """
+    root = ET.Element("DeviceManager")
+    root.set("version", "2.0")
 
-    # NetworkInfo block
-    net_info = ET.SubElement(root, "NetworkInfo")
-    ET.SubElement(net_info, "LocalIP").text  = local_ip
-    ET.SubElement(net_info, "Subnet").text   = subnet
-    ET.SubElement(net_info, "ScanDuration").text = f"{scan_duration:.1f}s"
+    for cam in cameras:
+        dev = ET.SubElement(root, "Device")
+        name = cam["serial"] or cam["ip"]
+        # Choose port: prefer 37777 (Dahua SDK), fallback to first open port
+        if 37777 in cam["open_ports"]:
+            port = 37777
+        elif cam["open_ports"]:
+            port = cam["open_ports"][0]
+        else:
+            port = 37777
+        dev.set("name",     name)
+        dev.set("domain",   name)
+        dev.set("port",     str(port))
+        dev.set("username", username)
+        dev.set("password", password)
+        dev.set("protocol", "1")
+        dev.set("connect",  "19")
 
-    # Cameras block
-    cameras_el = ET.SubElement(root, "Cameras")
-    for idx, cam in enumerate(cameras, start=1):
-        cam_el = ET.SubElement(cameras_el, "Camera")
-        cam_el.set("id", str(idx))
-
-        ET.SubElement(cam_el, "IP").text              = cam["ip"]
-        ET.SubElement(cam_el, "Hostname").text        = cam["hostname"]
-        ET.SubElement(cam_el, "MAC").text             = cam["mac"]
-        ET.SubElement(cam_el, "DiscoveryMethod").text = cam["discovery_method"]
-
-        # Ports
-        ports_el = ET.SubElement(cam_el, "Ports")
-        for port in sorted(cam["open_ports"]):
-            p_el = ET.SubElement(ports_el, "Port")
-            p_el.set("number",  str(port))
-            p_el.set("service", PORT_SERVICES.get(port, "UNKNOWN"))
-            p_el.set("state",   "open")
-
-        # DeviceInfo
-        dev_el = ET.SubElement(cam_el, "DeviceInfo")
-        ET.SubElement(dev_el, "Manufacturer").text   = cam["manufacturer"] or "Unknown"
-        ET.SubElement(dev_el, "Model").text          = cam["model"]        or "Unknown"
-        ET.SubElement(dev_el, "FirmwareVersion").text = cam["firmware"]    or "Unknown"
-        ET.SubElement(dev_el, "SerialNumber").text   = cam["serial"]       or "Unknown"
-
-        # Streams
-        streams_el = ET.SubElement(cam_el, "Streams")
-        stream_labels = ["main", "sub", "third", "fourth"]
-        for i, url in enumerate(cam["streams"]):
-            s_el = ET.SubElement(streams_el, "Stream")
-            s_el.set("type", stream_labels[i] if i < len(stream_labels) else f"stream{i+1}")
-            s_el.set("url",  url)
-
-    # Pretty-print via minidom
-    raw_xml = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    # Pretty-print via minidom, but strip the XML declaration (Dahua doesn't use one)
+    raw_xml = ET.tostring(root, encoding="unicode")
     dom = minidom.parseString(raw_xml)
-    pretty = dom.toprettyxml(indent="  ", encoding="UTF-8").decode("utf-8")
-    # minidom adds its own declaration — replace it
-    pretty = pretty.replace(
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<?xml version="1.0" encoding="UTF-8"?>'
-    )
-    return pretty
+    lines = dom.toprettyxml(indent="  ").splitlines()
+    # Remove first line (<?xml version="1.0" ?>) produced by minidom
+    return "\n".join(lines[1:])
 
 
 def save_xml(content: str, output_path: str) -> None:
@@ -476,6 +486,8 @@ def parse_args():
     parser.add_argument("--workers",       type=int,   default=200,  help="Thread pool size for port scanning (default: 200)")
     parser.add_argument("--no-onvif",      action="store_true",      dest="no_onvif", help="Skip ONVIF WS-Discovery")
     parser.add_argument("--no-portscan",   action="store_true",      dest="no_portscan", help="Skip port scanning (use ONVIF only)")
+    parser.add_argument("--username",      default="admin",           help="Camera username written into XML (default: admin)")
+    parser.add_argument("--password",      default="",                help="Dahua-encoded password string written verbatim into XML")
     return parser.parse_args()
 
 
@@ -551,7 +563,7 @@ def main():
 
     # --- XML export ---
     print(f"\nGenerating XML report -> {output_path}")
-    xml_content = build_xml(cam_list, local_ip, subnet, scan_duration)
+    xml_content = build_xml(cam_list, args.username, args.password)
     save_xml(xml_content, output_path)
     print(f"Saved: {output_path}")
     return 0
