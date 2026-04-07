@@ -30,6 +30,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from xml.dom import minidom
 
+# ANSI colors
+_B = "\033[1m";  _R = "\033[0m";  _C = "\033[96m"
+_G = "\033[92m"; _Y = "\033[93m"; _D = "\033[90m"
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -530,85 +534,181 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+# ---------------------------------------------------------------------------
+# Interactive UI
+# ---------------------------------------------------------------------------
 
-    # Resolve subnet list
-    if args.subnet:
-        subnets = [s.strip() for s in args.subnet.split(",") if s.strip()]
-    else:
-        subnets = get_all_local_subnets()
+def interactive_ui():
+    """Interactive terminal menu to configure and run the scanner."""
+    auto = get_all_local_subnets()
+    cfg = {
+        "subnet":       "",           # empty = auto
+        "timeout":      1.0,
+        "ports":        "",           # empty = default
+        "no_onvif":     False,
+        "no_portscan":  False,
+        "onvif_timeout": 3.0,
+        "workers":      200,
+        "username":     "admin",
+        "password":     "",
+        "output":       "",
+    }
 
+    def _show():
+        os.system("clear")
+        w = 54
+        subnet_disp = cfg["subnet"] or f"{_D}auto: {', '.join(auto)}{_R}"
+        ports_disp  = cfg["ports"]  or f"{_D}Standard{_R}"
+        onvif_disp  = f"{_D}✗ aus{_R}" if cfg["no_onvif"]    else f"{_G}✓ an{_R}"
+        scan_disp   = f"{_D}✗ aus{_R}" if cfg["no_portscan"] else f"{_G}✓ an{_R}"
+        out_disp    = cfg["output"] or f"{_D}~/Downloads/ip_cameras_<ts>.xml{_R}"
+
+        print(f"\n{_B}{_C}{'─' * w}{_R}")
+        print(f"{_B}{_C}  IP Camera Scanner{_R}")
+        print(f"{_B}{_C}{'─' * w}{_R}\n")
+        print(f"  {_Y}1{_R}  Subnets      {subnet_disp}")
+        print(f"  {_Y}2{_R}  Timeout      {cfg['timeout']}s")
+        print(f"  {_Y}3{_R}  Ports        {ports_disp}")
+        print(f"  {_Y}4{_R}  ONVIF        {onvif_disp}")
+        print(f"  {_Y}5{_R}  Port-Scan    {scan_disp}")
+        print(f"  {_Y}6{_R}  Username     {cfg['username'] or _D+'(leer)'+_R}")
+        print(f"  {_Y}7{_R}  Passwort     {'***' if cfg['password'] else _D+'(leer)'+_R}")
+        print(f"  {_Y}8{_R}  Output       {out_disp}")
+        print(f"\n{_B}{_C}{'─' * w}{_R}")
+        print(f"  {_B}{_G}S{_R}  Scan starten    {_B}{_D}Q{_R}  Beenden")
+        print(f"{_B}{_C}{'─' * w}{_R}\n")
+
+    while True:
+        _show()
+        choice = input(f"  {_B}Auswahl:{_R} ").strip().lower()
+
+        if choice == "q":
+            print()
+            return 0
+
+        elif choice == "s":
+            import argparse as _ap
+            args = _ap.Namespace(
+                subnet        = cfg["subnet"],
+                timeout       = cfg["timeout"],
+                ports         = cfg["ports"],
+                no_onvif      = cfg["no_onvif"],
+                no_portscan   = cfg["no_portscan"],
+                onvif_timeout = cfg["onvif_timeout"],
+                workers       = cfg["workers"],
+                username      = cfg["username"],
+                password      = cfg["password"],
+                output        = cfg["output"],
+            )
+            _run(args)
+            input(f"\n  {_D}[Enter] zurück zum Menü...{_R}")
+
+        elif choice == "1":
+            print(f"  {_D}Leer lassen für automatische Erkennung.{_R}")
+            print(f"  {_D}Mehrere mit Komma trennen: 192.168.1.0/24,10.0.0.0/24{_R}")
+            v = input(f"  {_Y}>{_R} Subnets: ").strip()
+            cfg["subnet"] = v
+
+        elif choice == "2":
+            v = input(f"  {_Y}>{_R} Timeout in Sekunden [{cfg['timeout']}]: ").strip()
+            try:
+                cfg["timeout"] = float(v)
+            except ValueError:
+                pass
+
+        elif choice == "3":
+            print(f"  {_D}Standard: {', '.join(str(p) for p in CAMERA_PORTS)}{_R}")
+            v = input(f"  {_Y}>{_R} Ports (kommagetrennt, leer = Standard): ").strip()
+            cfg["ports"] = v
+
+        elif choice == "4":
+            cfg["no_onvif"] = not cfg["no_onvif"]
+
+        elif choice == "5":
+            cfg["no_portscan"] = not cfg["no_portscan"]
+
+        elif choice == "6":
+            v = input(f"  {_Y}>{_R} Username [{cfg['username']}]: ").strip()
+            if v:
+                cfg["username"] = v
+
+        elif choice == "7":
+            v = input(f"  {_Y}>{_R} Passwort (Dahua-kodiert): ").strip()
+            cfg["password"] = v
+
+        elif choice == "8":
+            v = input(f"  {_Y}>{_R} Output-Pfad (leer = auto): ").strip()
+            cfg["output"] = v
+
+
+def _run(args):
+    """Execute the scan pipeline from parsed args (used by both UI and CLI)."""
+    subnets = [s.strip() for s in args.subnet.split(",") if s.strip()] \
+              if args.subnet else get_all_local_subnets()
+    ports   = [int(p.strip()) for p in args.ports.split(",") if p.strip()] \
+              if args.ports else CAMERA_PORTS
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = args.output or os.path.join(
+        os.path.expanduser("~/Downloads"), f"ip_cameras_{ts}.xml")
     local_ip = get_local_ip()
-    ports    = [int(p.strip()) for p in args.ports.split(",")] if args.ports else CAMERA_PORTS
 
-    # Resolve output path
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    downloads = os.path.expanduser("~/Downloads")
-    output_path = args.output or os.path.join(downloads, f"ip_cameras_{ts}.xml")
-
-    print("=" * 60)
-    print("  IP Camera Scanner")
-    print("=" * 60)
-    print(f"  Local IP   : {local_ip}")
-    print(f"  Subnets    : {', '.join(subnets)}")
-    print(f"  Ports      : {ports}")
-    print(f"  Output     : {output_path}")
-    print("=" * 60)
+    print(f"\n{_B}{_C}{'═' * 54}{_R}")
+    print(f"{_B}{_C}  Scan läuft...{_R}")
+    print(f"{_B}{_C}{'═' * 54}{_R}")
+    print(f"{_D}  Local IP : {local_ip}")
+    print(f"  Subnets  : {', '.join(subnets)}{_R}")
 
     start_time = time.time()
-    cameras = {}   # ip -> camera dict
+    cameras = {}
 
-    # --- Phase 1: ONVIF WS-Discovery ---
+    # Phase 1: ONVIF
     if not args.no_onvif:
-        print(f"\n[1/2] ONVIF WS-Discovery (listening {args.onvif_timeout:.0f}s)...")
-        onvif_devices = onvif_discover(timeout=args.onvif_timeout)
-        print(f"  Found {len(onvif_devices)} device(s) via ONVIF.")
-        for dev in onvif_devices:
+        print(f"\n{_B}[1/2] ONVIF WS-Discovery{_R} ({args.onvif_timeout:.0f}s)...")
+        for dev in onvif_discover(timeout=args.onvif_timeout):
             ip = dev["ip"]
             if ip not in cameras:
-                open_ports = scan_host_ports(ip, ports, args.timeout)
-                cam = enrich_camera(ip, open_ports, args.timeout, "ONVIF")
+                op = scan_host_ports(ip, ports, args.timeout)
+                cam = enrich_camera(ip, op, args.timeout, "ONVIF")
                 for scope in dev.get("scopes", []):
                     for brand, _ in BRAND_SIGNATURES:
                         if brand.lower() in scope.lower() and not cam["manufacturer"]:
                             cam["manufacturer"] = brand
                 cameras[ip] = cam
-                print(f"  + {ip}  [{cam['manufacturer'] or 'Unknown'}]  ports={open_ports}")
+                print(f"  {_G}+{_R} {ip}  [{cam['manufacturer'] or '?'}]  ports={op}")
+        print(f"  {_G}✓{_R} {len([c for c in cameras.values() if c['discovery_method']=='ONVIF'])} via ONVIF")
     else:
-        print("\n[1/2] ONVIF WS-Discovery skipped (--no-onvif).")
+        print(f"\n{_D}[1/2] ONVIF übersprungen.{_R}")
 
-    # --- Phase 2: Port scanning (all subnets) ---
+    # Phase 2: Port-Scan
     if not args.no_portscan:
-        for idx, subnet in enumerate(subnets, start=1):
-            print(f"\n[2/2] Port scanning {subnet} ({idx}/{len(subnets)})...")
-            scan_results = scan_subnet(subnet, ports, args.timeout, args.workers)
-            new_found = 0
-            for ip, open_ports in scan_results.items():
+        for idx, subnet in enumerate(subnets, 1):
+            print(f"\n{_B}[2/2] Port-Scan{_R}  {subnet}  ({idx}/{len(subnets)})...")
+            new = 0
+            for ip, op in scan_subnet(subnet, ports, args.timeout, args.workers).items():
                 if ip not in cameras:
-                    cam = enrich_camera(ip, open_ports, args.timeout, "PortScan")
+                    cam = enrich_camera(ip, op, args.timeout, "PortScan")
                     cameras[ip] = cam
-                    new_found += 1
-                    print(f"  + {ip}  [{cam['manufacturer'] or 'Unknown'}]  ports={open_ports}")
-            print(f"  Found {new_found} new device(s) on {subnet}.")
+                    new += 1
+                    print(f"  {_G}+{_R} {ip}  [{cam['manufacturer'] or '?'}]  ports={op}")
+            print(f"  {_G}✓{_R} {new} neue Gerät(e) auf {subnet}.")
     else:
-        print("\n[2/2] Port scanning skipped (--no-portscan).")
+        print(f"\n{_D}[2/2] Port-Scan übersprungen.{_R}")
 
-    # --- Results ---
-    scan_duration = time.time() - start_time
     cam_list = sorted(cameras.values(), key=lambda c: socket.inet_aton(c["ip"]))
+    dur = time.time() - start_time
 
-    print(f"\n{'=' * 60}")
-    print(f"  Scan complete in {scan_duration:.1f}s")
-    print(f"  Total cameras found: {len(cam_list)}")
-    print(f"{'=' * 60}")
+    print(f"\n{_B}{_G}{'═' * 54}{_R}")
+    print(f"{_B}{_G}  {len(cam_list)} Kamera(s) gefunden  —  {dur:.1f}s{_R}")
+    print(f"{_B}{_G}{'═' * 54}{_R}")
 
-    # --- XML export ---
-    print(f"\nGenerating XML report -> {output_path}")
-    xml_content = build_xml(cam_list, args.username, args.password)
-    save_xml(xml_content, output_path)
-    print(f"Saved: {output_path}")
-    return 0
+    save_xml(build_xml(cam_list, args.username, args.password), output_path)
+    print(f"\n{_G}✓ Gespeichert:{_R} {output_path}")
+
+
+def main():
+    if len(sys.argv) == 1:
+        return interactive_ui()
+    _run(parse_args())
 
 
 if __name__ == "__main__":
