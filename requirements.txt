@@ -1,0 +1,10 @@
+# ipcam_scanner.py — dependencies
+#
+# The scanner uses Python 3.7+ stdlib only — no pip install required.
+# The following optional packages enhance functionality if available:
+#
+# python-nmap>=0.7.1   # deeper port scanning via nmap binary (optional)
+# requests>=2.28       # cleaner HTTP probing (optional, falls back to urllib)
+#
+# Install optional extras:
+#   pip install python-nmap requests
